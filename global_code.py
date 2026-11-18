@@ -54,7 +54,7 @@ def configure_launcher(manager, name, disable):
         else:
             path.unlink(missing_ok=True)
         raise
-    print('Removed the global command.' if disable else f'Executable: {manager.command_bin_dir() / name}')
+    print('Removed the global command.' if disable else f'Executable: {manager.command_path(manager.command_bin_dir(), name)}')
 
 
 def json_object(raw):

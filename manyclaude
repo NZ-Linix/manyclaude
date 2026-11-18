@@ -523,9 +523,9 @@ def rename_alias(name, new_alias):
     save_profiles(profiles)
     print(f"{profile['name']}: {old_alias} → {new_alias}")
     if profile.get('rc'):
-        print(f"Executable: {command_bin_dir() / new_alias}. Restart existing shells to clear cached commands or old aliases.")
+        print(f"Executable: {command_path(command_bin_dir(), new_alias)}. Restart existing shells to clear cached commands or old aliases.")
     else:
-        print(f"Executable: {command_bin_dir() / new_alias}")
+        print(f"Executable: {command_path(command_bin_dir(), new_alias)}")
 
 
 def parse_code_alias(name, rc):
@@ -747,7 +747,7 @@ def listing():
         print(f"{p['name']} ({key})" + (' · regular Claude' if p.get('regular') else '') +
               f"\n  {p['app']}\n  {alias_name(key, p)}\n  Code command: {shlex.quote(str(ROOT / 'manyclaude'))} code {shlex.quote(key)}"
               f"\n  Code binary: {profile_binary(key)}" +
-              (f"\n  Named binary: {command_bin_dir() / alias_name(key, p)}" if not p.get('regular') else '') +
+              (f"\n  Named binary: {command_path(command_bin_dir(), alias_name(key, p))}" if not p.get('regular') else '') +
               f"\n  Desktop data: {p['desktop']}\n  Code data: {p['code']}\n")
 
 
