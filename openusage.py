@@ -1,7 +1,6 @@
 """OpenUsage discovery with shared live stores for isolated Code profiles."""
 import base64
 from datetime import datetime, timezone
-import fcntl
 import getpass
 import hashlib
 import json
@@ -11,6 +10,8 @@ import sys
 import shlex
 import unicodedata
 import uuid
+
+from compat import lock_file
 
 
 def service(directory):
@@ -146,6 +147,8 @@ def sync(manager, exclude=(), enable=False, disable=False):
     flag = manager.BASE / 'openusage-enabled'
     if not enable and not disable and not flag.exists():
         return []
+    if sys.platform == 'win32' and enable:
+        raise ValueError('OpenUsage export is not supported on Windows.')
     root = Path.home() / '.claude-swap-backup'
     if root.is_symlink():
         raise ValueError('Refusing to export through a redirected Claude-Swap folder.')
@@ -153,7 +156,7 @@ def sync(manager, exclude=(), enable=False, disable=False):
     messages = []
     with (root / '.lock').open('a+') as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(lock, blocking=False)
         except BlockingIOError:
             raise ValueError('Claude-Swap is busy; retry OpenUsage sync shortly.')
         registry = root / 'sequence.json'

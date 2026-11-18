@@ -262,6 +262,7 @@ class ProfileUI:
                      lambda value: self.manager.validate_alias(value, self.manager.read_profiles())),
                     ('Applications folder', self.manager.default_apps_dir(),
                      'Desktop entries go in your user applications folder; no sudo needed.' if self.manager.LINUX else
+                     'Start Menu shortcuts go in your user Start Menu folder.' if getattr(self.manager, 'WINDOWS', False) else
                      'Use ~/Applications if the system Applications folder is not writable.',
                      lambda value: value.strip() or self.manager.default_apps_dir())]
                 label, default, help_text, validator = fields[step]

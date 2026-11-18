@@ -1,0 +1,51 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  unix:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m unittest discover -s tests
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Windows unit tests
+        run: python -m unittest tests.test_windows -v
+      - name: Install from checkout
+        shell: powershell
+        run: .\install.ps1
+      - name: Smoke test profile lifecycle
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
+          $fake = Join-Path $env:RUNNER_TEMP 'Claude\claude.exe'
+          New-Item -ItemType Directory -Force (Split-Path $fake) | Out-Null
+          Copy-Item (Get-Command python).Source $fake
+          function Check { if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" } }
+          manyclaude --version; Check
+          manyclaude create Work --claude-app $fake; Check
+          manyclaude list; Check
+          $lnk = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\ManyClaude\Claude Work.lnk'
+          if (-not (Test-Path $lnk)) { throw "missing shortcut $lnk" }
+          if (-not (Get-Command claude-work -ErrorAction SilentlyContinue)) { throw 'claude-work command missing' }
+          Get-Content (Get-Command claude-work).Source
+          manyclaude refresh; Check
+          manyclaude remove Work; Check
+          if (Test-Path $lnk) { throw 'shortcut not removed' }

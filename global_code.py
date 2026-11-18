@@ -1,7 +1,6 @@
 """Choose a model and account before starting native Claude Code."""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
-import fcntl
 import hashlib
 import json
 import math
@@ -12,6 +11,8 @@ import subprocess
 import sys
 import tempfile
 import time
+
+from compat import link as make_link, lock_file
 
 from runtime import claude_command, is_claude_subcommand
 
@@ -161,7 +162,7 @@ def save_usage(manager, identity, data):
     model = data.get('model') or {}
     workspace = data.get('workspace') or {}
     with (manager.BASE / '.manager.lock').open('a+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock)
         state = read_json(path)
         windows = state.setdefault('windows', {})
         cached = state.setdefault('cache', {})
@@ -245,7 +246,7 @@ def session_store(manager, profile, directory='global-code', settings=None):
 
     store = manager.BASE / directory
     with (manager.BASE / '.manager.lock').open('a+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock)
         store.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         store.mkdir(mode=0o700, exist_ok=True)
         source = Path(profile['code'])
@@ -261,14 +262,14 @@ def session_store(manager, profile, directory='global-code', settings=None):
             origin = source / name
             if origin.exists():
                 try:
-                    (store / name).symlink_to(origin, target_is_directory=origin.is_dir())
+                    make_link(origin, store / name)
                 except FileExistsError:
                     pass
-        if sys.platform.startswith('linux'):
+        if sys.platform != 'darwin':
             credentials = source / '.credentials.json'
             link = store / '.credentials.json'
             if credentials.is_file() and not os.path.lexists(link):
-                link.symlink_to(credentials)
+                make_link(credentials, link, False)
     return store
 
 

@@ -63,6 +63,8 @@ def claude_command():
             folder = str(Path(binary).parent)
             env['PATH'] = os.pathsep.join([folder, *[p for p in env['PATH'].split(os.pathsep) if p != folder]])
     if not binary or not Path(binary).is_file() or not os.access(binary, os.X_OK):
+        if os.name == 'nt':
+            raise ValueError('Claude Code is not installed. Install it in PowerShell: irm https://claude.ai/install.ps1 | iex')
         raise ValueError('Claude Code is not installed. Native install (including Omarchy): '
                          'curl -fsSL https://claude.ai/install.sh | bash; '
                          'or, if you prefer mise: mise use -g claude@latest.')

@@ -3,7 +3,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import shlex
 import shutil
 import signal
 import subprocess
@@ -54,18 +53,26 @@ def start(manager, arguments):
                 'binary': binary, 'store': str(store), 'rows': rows, 'efforts': efforts,
                 'base_url': gateway.environment['ANTHROPIC_BASE_URL'],
             }))
-            wrapper = directory / 'claude'
-            wrapper.write_text('#!/bin/sh\nexec ' + shlex.join([
-                sys.executable, str(manager.ROOT / 'manyclaude'), '_acp-code', str(payload),
-            ]) + ' "$@"\n')
+            from compat import command_path, command_script
+            wrapper = command_path(directory, 'claude')
+            marker = '@echo off\r\n' if os.name == 'nt' else '#!/bin/sh\n'
+            wrapper.write_text(command_script(marker, [sys.executable, manager.ROOT / 'manyclaude', '_acp-code',
+                                                       payload]), newline='')
             wrapper.chmod(0o700)
             env.update(CLAUDE_CODE_EXECUTABLE=str(wrapper), CLAUDE_CONFIG_DIR=str(store),
                        CLAUDE_SECURESTORAGE_CONFIG_DIR='' if profile.get('regular') else
                        profile.get('code_session', profile['code']))
-            with subprocess.Popen(command, env=gateway.session_environment(env), start_new_session=True) as process:
+            if os.name == 'nt':
+                options = {'creationflags': subprocess.CREATE_NEW_PROCESS_GROUP}
+            else:
+                options = {'start_new_session': True}
+            with subprocess.Popen(command, env=gateway.session_environment(env), **options) as process:
                 def stop(signum, _):
                     try:
-                        os.killpg(process.pid, signum)
+                        if os.name == 'nt':
+                            process.terminate()
+                        else:
+                            os.killpg(process.pid, signum)
                     except ProcessLookupError:
                         pass
 
@@ -91,6 +98,9 @@ def code(path, arguments):
         arguments = picker_arguments({'code': payload['store']}, arguments, {}, routes=payload['rows'],
                                      efforts=payload.get('efforts'),
                                      gateway_env={'ANTHROPIC_BASE_URL': payload['base_url']}, sdk=True)
+    if os.name == 'nt':
+        from compat import exec_replace
+        exec_replace(binary, [binary, *arguments])
     os.execv(binary, [binary, *arguments])
 
 

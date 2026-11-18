@@ -140,7 +140,34 @@ def update_linux(manager, yes=False):
     print('Claude updated. Reopen Desktop apps and restart Code sessions to use the new versions.')
 
 
+def update_windows(manager):
+    from runtime import claude_command
+    profiles = manager.read_profiles()
+    sources = sorted({manager.source_app(p['source']) for p in profiles.values()}) or [manager.source_app()]
+    check_closed(manager, profiles, sources)
+    binary, env = claude_command()
+    for field in (*manager.AUTH_ENV, 'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'CLAUDE_USER_DATA_DIR'):
+        env.pop(field, None)
+    if '@anthropic-ai' in str(Path(binary).resolve()) or Path(binary).suffix.lower() == '.cmd':
+        npm = shutil.which('npm', path=env.get('PATH'))
+        if not npm:
+            raise ValueError('The npm-managed CLI requires npm on PATH to update.')
+        command = [npm, 'install', '-g', '@anthropic-ai/claude-code@latest']
+    else:
+        command = [binary, 'install', 'latest']
+    print('Updating the shared Claude Code binary to latest…', flush=True)
+    subprocess.run(command, env=env, check=True)
+    # Claude Desktop updates itself on Windows; shortcuts always start its newest version.
+    print('Refreshing all Desktop profiles…', flush=True)
+    manager.refresh()
+    current, current_env = claude_command()
+    subprocess.run([current, '--version'], env=env, check=True)
+    print('Claude Code updated. Claude Desktop updates itself; restart it to apply a downloaded update.')
+
+
 def update(manager, yes=False):
+    if getattr(manager, 'WINDOWS', False):
+        return update_windows(manager)
     if getattr(manager, 'LINUX', False):
         return update_linux(manager, yes)
     profiles = manager.read_profiles()

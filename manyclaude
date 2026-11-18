@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Small macOS/Linux Claude Desktop / Claude Code profile manager; stdlib only."""
+"""Small macOS/Linux/Windows Claude Desktop / Claude Code profile manager; stdlib only."""
 import argparse
-import fcntl
 import hashlib
 import json
 import os
@@ -15,12 +14,30 @@ import sys
 import tempfile
 import unicodedata
 from runtime import shell_quote
+from compat import (WINDOWS, command_path, command_script, exec_replace, is_link, link as make_link,
+                    lock_file, read_link)
 
 VERSION = "1.13.0"
 LINUX = sys.platform.startswith("linux")
 
 
+def desktop_module():
+    """Desktop integration for Linux (XDG) or Windows (Start Menu); macOS builds .app bundles."""
+    if WINDOWS:
+        import windows_desktop
+        return windows_desktop
+    import linux_desktop
+    return linux_desktop
+
+
+def native_mac():
+    return not LINUX and not WINDOWS
+
+
 def default_apps_dir():
+    if WINDOWS:
+        from windows_desktop import applications_dir
+        return str(applications_dir())
     if LINUX:
         from linux_desktop import applications_dir
         return str(applications_dir())
@@ -28,6 +45,9 @@ def default_apps_dir():
 
 
 def default_home():
+    if WINDOWS:
+        from windows_desktop import local
+        return local() / "manyclaude"
     if LINUX:
         from linux_desktop import xdg_directory
         return xdg_directory("XDG_DATA_HOME", ".local/share") / "manyclaude"
@@ -35,6 +55,9 @@ def default_home():
 
 
 def regular_desktop_data():
+    if WINDOWS:
+        from windows_desktop import regular_data
+        return regular_data()
     if LINUX:
         from linux_desktop import regular_data
         return regular_data()
@@ -79,7 +102,7 @@ def validate_alias(value, profiles, own_key=None, own_custom=None):
     from global_code import launcher_name
     custom = custom_profiles.read(BASE)
     existing = shutil.which(value)
-    own_command = existing == str(command_bin_dir() / value) and (
+    own_command = existing is not None and Path(existing) == command_path(command_bin_dir(), value) and (
         (own_key in profiles and alias_name(own_key, profiles[own_key]) == value)
         or (own_custom in custom and custom[own_custom].get('command') == value))
     if value in reserved or (existing and not own_command):
@@ -123,7 +146,7 @@ def sync_openusage(exclude=(), enable=False, disable=False, quiet=False):
     try:
         if quiet:
             with (BASE / '.manager.lock').open('a+') as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+                lock_file(lock)
                 messages = openusage.sync(sys.modules[__name__], exclude, enable, disable)
         else:
             messages = openusage.sync(sys.modules[__name__], exclude, enable, disable)
@@ -138,6 +161,9 @@ def sync_openusage(exclude=(), enable=False, disable=False, quiet=False):
 
 
 def shell_rc():
+    if WINDOWS:
+        raise ValueError("Windows has no shell startup file to manage; ManyClaude commands are installed in "
+                         + str(command_bin_dir()) + ".")
     shell = Path(os.environ.get("SHELL", "/bin/zsh")).name
     if shell == "fish":
         config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
@@ -165,11 +191,13 @@ def command_bin_dir():
 
 def profile_binary(key):
     directory = ROOT if (ROOT / 'command-bin-dir').is_file() else BASE / 'bin'
-    return directory / ('manyclaude-code-' + key)
+    return command_path(directory, 'manyclaude-code-' + key)
 
 
 def command_marker():
     owner = hashlib.sha256((str(ROOT) + '\n' + str(BASE)).encode()).hexdigest()
+    if WINDOWS:
+        return '@echo off\r\nrem manyclaude profile launcher ' + owner + '\r\n'
     return '#!/bin/sh\n# manyclaude profile launcher ' + owner + '\n'
 
 
@@ -178,25 +206,21 @@ def sync_commands(profiles, dry_run=False):
     marker = command_marker()
     desired = {}
     global_name = launcher_name(BASE)
+    home = {'MANYCLAUDE_HOME': str(BASE)}
     if global_name:
-        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
-                              str(ROOT / 'manyclaude'), 'global'])
-        desired[command_bin_dir() / global_name] = marker + 'exec ' + command + ' "$@"\n'
+        desired[command_path(command_bin_dir(), global_name)] = command_script(
+            marker, [sys.executable, ROOT / 'manyclaude', 'global'], home)
     import custom_profiles
     for key, item in custom_profiles.read(BASE).items():
-        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
-                              str(ROOT / 'manyclaude'), 'custom-run', key])
-        path = command_bin_dir() / item['command']
+        path = command_path(command_bin_dir(), item['command'])
         if path in desired:
             raise ValueError(f'ManyClaude command collision: {path}')
-        desired[path] = marker + 'exec ' + command + ' "$@"\n'
+        desired[path] = command_script(marker, [sys.executable, ROOT / 'manyclaude', 'custom-run', key], home)
     for key, profile in profiles.items():
-        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
-                              str(ROOT / 'manyclaude'), 'code', key])
-        content = marker + 'exec ' + command + ' "$@"\n'
+        content = command_script(marker, [sys.executable, ROOT / 'manyclaude', 'code', key], home)
         paths = [profile_binary(key)]
         if not profile.get('regular'):
-            paths.append(command_bin_dir() / alias_name(key, profile))
+            paths.append(command_path(command_bin_dir(), alias_name(key, profile)))
         for path in paths:
             if path in desired:
                 raise ValueError(f'ManyClaude command collision: {path}')
@@ -267,9 +291,8 @@ def sync_aliases(profiles, extra=(), dry_run=False):
 
 
 def source_app(path=None):
-    if LINUX:
-        from linux_desktop import source_app as linux_source
-        return linux_source(path)
+    if LINUX or WINDOWS:
+        return desktop_module().source_app(path)
     candidates = [Path(path).expanduser()] if path else [Path("/Applications/Claude.app"), Path.home() / "Applications/Claude.app"]
     for app in candidates:
         if (app / "Contents/Info.plist").is_file():
@@ -307,14 +330,14 @@ def prepare_skills(profile):
               if not entry.name.startswith('.') and entry.name != 'synced' and entry.is_dir()} if source.is_dir() else {}
     # Identify only our direct links, including dangling ones after uninstall.
     for entry in target.iterdir():
-        if entry.is_symlink() and entry.readlink() == source / entry.name and entry.name not in shared:
+        if is_link(entry) and read_link(entry) == source / entry.name and entry.name not in shared:
             try:
                 entry.unlink()
             except FileNotFoundError:
                 pass
     for name, entry in shared.items():
         try:
-            (target / name).symlink_to(entry, target_is_directory=True)
+            make_link(entry, target / name, True)
         except FileExistsError:
             # A profile-local skill (or a user-managed link) wins a name conflict.
             pass
@@ -347,16 +370,15 @@ def prepare_profile(profile):
     from profile_config import STATE
     if (BASE / STATE).exists():
         with (BASE / '.manager.lock').open('a+') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock_file(lock)
             sync_config()
     prepare_skills(profile)
 
 
 def build_app(key, profile):
     prepare_skills(profile)
-    if LINUX:
-        import linux_desktop
-        return linux_desktop.build_app(sys.modules[__name__], key, profile)
+    if LINUX or WINDOWS:
+        return desktop_module().build_app(sys.modules[__name__], key, profile)
     target = Path(profile["app"])
     if target.exists():
         info_file = target / "Contents/Info.plist"
@@ -445,10 +467,15 @@ def add(args):
         return
     alias = validate_alias(args.alias or 'claude-' + key, profiles)
     app_name = validate_name(args.app_name) if args.app_name is not None else 'Claude ' + name
-    app = Path(args.apps_dir).expanduser().absolute() / (f"manyclaude-{key}.desktop" if LINUX else f"{app_name}.app")
+    if WINDOWS:
+        from windows_desktop import shortcut_name
+        app_file = shortcut_name(app_name) + '.lnk'
+    else:
+        app_file = f"manyclaude-{key}.desktop" if LINUX else f"{app_name}.app"
+    app = Path(args.apps_dir).expanduser().absolute() / app_file
     if app.exists():
         raise ValueError(f"App already exists: {app}")
-    rc = None if args.no_alias else str(Path(args.rc).expanduser().absolute().resolve() if args.rc else shell_rc().resolve())
+    rc = None if args.no_alias or WINDOWS else str(Path(args.rc).expanduser().absolute().resolve() if args.rc else shell_rc().resolve())
     # Validate shell file before creating the app.
     if rc:
         shell_block(Path(rc).read_text() if Path(rc).exists() else "", "")
@@ -465,12 +492,14 @@ def add(args):
         forget_profile(sys.modules[__name__], key)
         sync_aliases(profiles)
     except Exception:
-        app.unlink() if LINUX else shutil.rmtree(app)
+        shutil.rmtree(app) if native_mac() else app.unlink()
         raise
     save_profiles(profiles)
     print(f"\nCreated {name}\n  Desktop: {app}\n  Code:    {alias}\n  Data:    {directory}")
     if rc:
         print(f"\nOpen a new terminal or run: source {shell_quote(rc, Path(rc).suffix == '.fish')}")
+    elif WINDOWS:
+        print(f"\nOpen a new terminal to use {alias} (installed in {command_bin_dir()}).")
     print(f"Sign in separately in Desktop and in: manyclaude code {key}")
 
 
@@ -560,7 +589,7 @@ def code_options(name, variables=None, flags=None, from_alias=None, rc=None, cle
                           'trust_folders': profile.get('trust_folders', False),
                           'allow_external_imports': profile.get('allow_external_imports', False)}, indent=2))
         return
-    if profile.get('regular'):
+    if profile.get('regular') and not WINDOWS:
         old_rc = profile.get('rc')
         has_defaults = any(profiles[key].get(field) for field in
                            ('code_env', 'code_args', 'trust_folders', 'allow_external_imports'))
@@ -568,7 +597,9 @@ def code_options(name, variables=None, flags=None, from_alias=None, rc=None, cle
         sync_aliases(profiles, [old_rc] if old_rc else [])
     save_profiles(profiles)
     print(f"Saved Code defaults for {profile['name']}. Its command forwards additional flags unchanged.")
-    if profile.get('regular'):
+    if profile.get('regular') and WINDOWS:
+        print(f"On Windows, the plain claude command is unchanged; run manyclaude code {key} to use these defaults.")
+    elif profile.get('regular'):
         rc = profiles[key].get('rc') or old_rc or shell_rc()
         print('Reload your shell to update the claude alias: source ' + shell_quote(rc, Path(rc).suffix == '.fish'))
 
@@ -605,7 +636,7 @@ def configure_code_project(profile):
         updates.setdefault(str(project_root), {}).update(hasClaudeMdExternalIncludesApproved=True,
                                                         hasClaudeMdExternalIncludesWarningShown=True)
     with (BASE / '.manager.lock').open('a+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock)
         data = json.loads(config.read_text()) if config.exists() else {}
         projects = data.setdefault('projects', {})
         changed = False
@@ -677,6 +708,8 @@ def code(name, arguments, *, own_login=False, global_session=None, runner=None, 
             if (BASE / 'openusage-enabled').exists():
                 sync_openusage(quiet=True)
         raise SystemExit(result if result >= 0 else 128 - result)
+    if WINDOWS:
+        exec_replace(binary, [binary, *arguments], env)
     os.execvpe(binary, [binary, *arguments], env)
 
 
@@ -695,11 +728,10 @@ def code_command(name, arguments):
 
 def desktop(name):
     key, profile = get_profile(name)
-    if LINUX:
-        import linux_desktop
+    if LINUX or WINDOWS:
         if not profile.get("regular") and not Path(profile["app"]).exists():
             raise ValueError("Profile launcher is missing. Run manyclaude refresh.")
-        return linux_desktop.launch(sys.modules[__name__], key, profile, background=True)
+        return desktop_module().launch(sys.modules[__name__], key, profile, background=True)
     if not Path(profile["app"]).exists():
         raise ValueError("Profile app is missing. Run manyclaude refresh.")
     if profile.get('regular'):
@@ -733,9 +765,8 @@ def refresh(name=None):
 
 
 def running(profile):
-    if LINUX:
-        from linux_desktop import running as linux_running
-        return linux_running(profile)
+    if LINUX or WINDOWS:
+        return desktop_module().running(profile)
     if profile.get('regular'):
         executable = str(Path(profile['app']) / 'Contents/MacOS/')
         result = subprocess.run(['/bin/ps', '-ax', '-o', 'command='], capture_output=True, text=True, check=True)
@@ -746,7 +777,7 @@ def running(profile):
         return False
     with path.open("a+") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_file(lock, blocking=False)
             return False
         except BlockingIOError:
             return True
@@ -764,6 +795,8 @@ def reset_paths(key, profile):
             from linux_desktop import xdg_directory
             paths = [regular_desktop_data(), home / '.claude', home / '.claude.json',
                      xdg_directory('XDG_CACHE_HOME', '.cache') / 'Claude']
+        if WINDOWS:
+            paths = [regular_desktop_data(), home / '.claude', home / '.claude.json']
         paths += list(home.glob('.claude.json.backup*'))
         if profile['code'] != str(home / '.claude') or profile['desktop'] != str(paths[0]):
             raise ValueError('Regular profile has unexpected data paths. Refusing to reset.')
@@ -784,7 +817,13 @@ def reset_paths(key, profile):
 def reset_data(name):
     key, profile = get_profile(name)
     paths = reset_paths(key, profile)
-    if profile.get('regular'):
+    if profile.get('regular') and WINDOWS:
+        from compat import code_commands
+        if any(running(p) for p in read_profiles().values()):
+            raise ValueError('Quit all Claude Desktop instances before resetting the regular profile.')
+        if code_commands():
+            raise ValueError('Quit all Claude Code sessions before resetting the regular profile.')
+    elif profile.get('regular'):
         if LINUX and any(running(p) for p in read_profiles().values()):
             raise ValueError('Quit all Claude Desktop instances before resetting the regular profile.')
         executables = {str(Path(p['app']) / 'Contents/MacOS/') for p in read_profiles().values()}
@@ -801,9 +840,13 @@ def reset_data(name):
     root = Path.home().resolve()
     unresolved_root = Path.home()
     for path in paths:
-        if LINUX and profile.get('regular'):
-            from linux_desktop import xdg_directory
-            roots = [Path.home(), xdg_directory('XDG_CONFIG_HOME', '.config'), xdg_directory('XDG_CACHE_HOME', '.cache')]
+        if (LINUX or WINDOWS) and profile.get('regular'):
+            if WINDOWS:
+                from windows_desktop import roaming
+                roots = [Path.home(), roaming()]
+            else:
+                from linux_desktop import xdg_directory
+                roots = [Path.home(), xdg_directory('XDG_CONFIG_HOME', '.config'), xdg_directory('XDG_CACHE_HOME', '.cache')]
             parent = next((r for r in roots if path.is_relative_to(r)), None)
             if parent is None or parent.is_symlink():
                 raise ValueError(f'Refusing to clear a redirected data path: {path}')
@@ -819,7 +862,7 @@ def reset_data(name):
         sync_openusage(exclude=(key,))
     from profile_config import forget_profile
     forget_profile(sys.modules[__name__], key)
-    if not LINUX:
+    if native_mac():
         result = subprocess.run(['/usr/bin/security', 'delete-generic-password', '-s', service], capture_output=True, text=True)
         if result.returncode not in (0, 44):
             raise ValueError('Could not remove Code Keychain credentials: ' + result.stderr.strip())
@@ -854,9 +897,8 @@ def remove(name, purge=False):
     del profiles[key]
     app = Path(profile["app"])
     if app.exists() or app.is_symlink():
-        if LINUX:
-            from linux_desktop import owned
-            owned(sys.modules[__name__], key, app)
+        if LINUX or WINDOWS:
+            desktop_module().owned(sys.modules[__name__], key, app)
         else:
             info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
             if info.get("ManyClaudeProfile") != str(BASE / "profiles" / key):
@@ -874,7 +916,7 @@ def remove(name, purge=False):
             raise ValueError('Refusing to delete a profile folder redirected outside ManyClaude.')
         data_paths = reset_paths(key, profile)
         # Login tokens on macOS live in a profile-specific Keychain service.
-        if not LINUX:
+        if native_mac():
             digest = hashlib.sha256(unicodedata.normalize('NFC', profile['code']).encode()).hexdigest()[:8]
             result = subprocess.run(['/usr/bin/security', 'delete-generic-password', '-s',
                                      'Claude Code-credentials-' + digest], capture_output=True, text=True)
@@ -882,7 +924,9 @@ def remove(name, purge=False):
                 raise ValueError('Could not remove the profile Keychain credential: ' + result.stderr.strip())
     sync_aliases(profiles, extra_rc)
     if app.exists():
-        if LINUX:
+        if WINDOWS:
+            app.unlink()
+        elif LINUX:
             app.unlink()
             from linux_desktop import refresh_database
             refresh_database(app.parent)
@@ -902,7 +946,10 @@ def remove(name, purge=False):
 def wizard():
     if not sys.stdin.isatty():
         raise ValueError('The wizard needs a terminal. Use: manyclaude create "Personal"')
-    import curses
+    try:
+        import curses
+    except ImportError:
+        raise ValueError('The wizard needs curses. On Windows: python -m pip install --user windows-curses') from None
     from tui import ProfileUI
     curses.wrapper(lambda screen: ProfileUI(screen, sys.modules[__name__]).run())
 
@@ -911,7 +958,7 @@ def ensure_storage(check=False):
     from storage import migrate
     BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
     with (BASE / '.manager.lock').open('a+') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        lock_file(lock)
         migrate(sys.modules[__name__], check=check)
 
 
@@ -929,12 +976,16 @@ def main(argv=None):
         return prepare_profile(profile)
     # Desktop entries use this internal foreground runner; keep it out of user help.
     if argv[:1] == ['_desktop-run']:
-        if not LINUX or len(argv) != 2:
-            raise ValueError('Invalid Linux desktop launcher invocation.')
+        if WINDOWS and len(argv) == 4 and argv[2] == '--home':
+            # Windows shortcuts cannot set environment variables; they pass the registry home instead.
+            global BASE
+            BASE = Path(argv[3]).absolute()
+            argv = argv[:2]
+        if not (LINUX or WINDOWS) or len(argv) != 2:
+            raise ValueError('Invalid Linux/Windows desktop launcher invocation.')
         ensure_storage()
-        import linux_desktop
         key, profile = get_profile(argv[1])
-        return linux_desktop.launch(sys.modules[__name__], key, profile)
+        return desktop_module().launch(sys.modules[__name__], key, profile)
     if argv[:1] == ['_global-status']:
         from global_code import status_line
         return status_line(sys.modules[__name__], *argv[1:])
@@ -957,7 +1008,7 @@ def main(argv=None):
         import custom_profiles
         ensure_storage()
         return custom_profiles.run(sys.modules[__name__], argv[1], argv[2:])
-    parser = argparse.ArgumentParser(description="Separate Claude accounts on macOS and Linux. Run without arguments for the wizard.")
+    parser = argparse.ArgumentParser(description="Separate Claude accounts on macOS, Linux and Windows. Run without arguments for the wizard.")
     parser.add_argument("--version", action="version", version=VERSION)
     commands = parser.add_subparsers(dest="command")
     create = commands.add_parser("create", help="create a Desktop app and Claude Code executable")
@@ -966,7 +1017,7 @@ def main(argv=None):
     create.add_argument('--regular', action='store_true', help='use the existing regular Claude app and claude command')
     create.add_argument("--alias", help="custom Claude Code executable name (default: claude-<profile>)")
     create.add_argument("--apps-dir", default=default_apps_dir())
-    create.add_argument("--claude-app", help="Claude.app on macOS; claude-desktop executable/AppImage on Linux")
+    create.add_argument("--claude-app", help="Claude.app on macOS; claude-desktop executable/AppImage on Linux; claude.exe on Windows")
     create.add_argument("--rc", help="shell startup file (default: zsh/bash/fish startup file)")
     create.add_argument("--no-alias", action="store_true")
     commands.add_parser("list", help="list profiles")
@@ -1044,8 +1095,8 @@ def main(argv=None):
     folders.add_argument('--add', action='append', metavar='FOLDER')
     folders.add_argument('--remove', action='append', metavar='FOLDER')
     args = parser.parse_args(argv)
-    if sys.platform != "darwin" and not LINUX:
-        raise ValueError("manyclaude supports macOS and Linux.")
+    if sys.platform != "darwin" and not LINUX and not WINDOWS:
+        raise ValueError("manyclaude supports macOS, Linux and Windows.")
     ensure_storage(check=args.command == "migrate" and args.check)
     if args.command == "migrate":
         return
@@ -1068,7 +1119,7 @@ def main(argv=None):
                         'update-claude', 'sync-config', 'global-alias', 'custom', 'prompt-folders'):
         BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
         with (BASE / ".manager.lock").open("a+") as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+            lock_file(lock)
             if args.command in ('custom', 'prompt-folders'):
                 import custom_profiles
                 manager = sys.modules[__name__]

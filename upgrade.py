@@ -1,5 +1,4 @@
 """Remove obsolete ManyClaude services and their metadata during installation."""
-import fcntl
 import hashlib
 import os
 from pathlib import Path
@@ -8,8 +7,12 @@ import signal
 import subprocess
 import time
 
+from compat import lock_file
+
 
 def remove_chat_sync(manager):
+    if os.name == 'nt':
+        return  # The chat sync service never existed on Windows.
     label = 'local.manyclaude.sync.' + hashlib.sha256(str(manager.BASE).encode()).hexdigest()[:12]
     if manager.LINUX:
         config = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
@@ -46,7 +49,7 @@ def remove_chat_sync(manager):
     if lock_path.exists():
         with lock_path.open('r+') as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_file(lock, blocking=False)
             except BlockingIOError:
                 pid = int(lock.read().strip())
                 if pid <= 1:
@@ -62,7 +65,7 @@ def remove_chat_sync(manager):
                     pass
                 for _ in range(250):
                     try:
-                        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                        lock_file(lock, blocking=False)
                         break
                     except BlockingIOError:
                         time.sleep(.1)

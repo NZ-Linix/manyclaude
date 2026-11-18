@@ -1,6 +1,6 @@
 # manyclaude
 
-A small macOS and Linux CLI for multiple Claude accounts, including **Arch Linux and Omarchy**. No pip/npm packages, server, or background chat service. Requires Python 3 and an installed Claude Desktop app. macOS also needs Apple's Command Line Tools (`xcode-select --install`); Linux does not. Claude Code can be installed natively, through a package manager, or through **mise**, including Omarchy's agent installer.
+A small macOS, Linux and Windows CLI for multiple Claude accounts, including **Arch Linux and Omarchy**. No pip/npm packages, server, or background chat service. Requires Python 3 and an installed Claude Desktop app. macOS also needs Apple's Command Line Tools (`xcode-select --install`); Linux does not. Claude Code can be installed natively, through a package manager, or through **mise**, including Omarchy's agent installer.
 
 ```sh
 ./install.sh
@@ -16,23 +16,23 @@ macOS / Linux:
 curl -fsSL https://raw.githubusercontent.com/NZ-Linix/manyclaude/main/install.sh | sh
 ```
 
-Windows (PowerShell; installs into WSL, since ManyClaude runs on Linux there):
+Windows (PowerShell):
 
 ```powershell
 irm https://raw.githubusercontent.com/NZ-Linix/manyclaude/main/install.ps1 | iex
 ```
 
-While the repository is private, those raw URLs need authentication. With the GitHub CLI signed in (`gh auth login`), use:
+`MANYCLAUDE_REF` picks a branch or tag to install.
 
-```sh
-gh api repos/NZ-Linix/manyclaude/contents/install.sh -H 'Accept: application/vnd.github.raw' | sh
-```
+## Windows
 
-```powershell
-gh api repos/NZ-Linix/manyclaude/contents/install.ps1 -H 'Accept: application/vnd.github.raw' | Out-String | iex
-```
+The Windows installer needs Python 3.10+ (installed through winget if missing) and puts ManyClaude in `%LOCALAPPDATA%\manyclaude`, with its commands in `%LOCALAPPDATA%\manyclaude\bin` on your user PATH. Install [Claude Desktop](https://claude.ai/download) and Claude Code (`irm https://claude.ai/install.ps1 | iex`) first.
 
-The installers use `gh auth token` or `GITHUB_TOKEN` to download the source. `MANYCLAUDE_REF` picks a branch or tag; `MANYCLAUDE_WSL_DISTRO` picks the WSL distribution on Windows.
+- Each profile gets a Start Menu shortcut (Start Menu → ManyClaude) that runs Claude Desktop with its own data folder, and a `claude-<profile>` command (a `.cmd` file) for Claude Code.
+- Profile data lives in `%USERPROFILE%\.claude-<profile>`, as on macOS and Linux.
+- `manyclaude update-claude` updates Claude Code; Claude Desktop updates itself.
+- Skills are shared with symlinks when Windows allows them (Developer Mode) and with directory junctions otherwise.
+- Not available on Windows: OpenUsage export and changing the plain `claude` command for the regular profile (use `manyclaude code <profile>`).
 
 ## Arch Linux / Omarchy installation
 

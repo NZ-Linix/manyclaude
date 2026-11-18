@@ -25,9 +25,18 @@ def check_closed(manager, profile, action='migrating its data'):
         raise ValueError(f"Quit {profile['name']}'s Claude Desktop before {action}.")
     for file in (Path(profile['code']) / 'sessions').glob('*.json'):
         if file.stem.isdigit():
+            if os.name == 'nt':
+                from compat import pid_command
+                command = pid_command(file.stem)
+                if command and 'claude' in command.lower():
+                    raise ValueError(f"Quit {profile['name']}'s Claude Code sessions before {action}.")
+                continue
             result = subprocess.run(['/bin/ps', '-p', file.stem, '-o', 'command='], capture_output=True, text=True)
             if result.returncode == 0 and 'claude' in result.stdout.lower():
                 raise ValueError(f"Quit {profile['name']}'s Claude Code sessions before {action}.")
+    if os.name == 'nt':
+        # Windows does not expose other processes' environments; session files cover running clients.
+        return
     # Cover clients that have not written a sessions/PID file yet. Keep process
     # environments in memory: they may contain tokens and must never be logged.
     directories = {profile['code'], profile.get('code_session', profile['code'])}
@@ -159,7 +168,7 @@ def migrate(manager, check=False, rebuild=True):
                 raise ValueError('Migration destination is missing; original data retained.')
             # Keychain service names depend on the literal config path. Linked
             # OpenUsage profiles retain their service; only their symlink moves.
-            if not manager.LINUX and not (profile or {}).get('code_session'):
+            if manager.native_mac() and not (profile or {}).get('code_session'):
                 import openusage
                 openusage.copy_keychain_store(str(old / 'code'), str(target))
             if profile and profile.get('code_session'):
@@ -179,7 +188,7 @@ def migrate(manager, check=False, rebuild=True):
             state['phase'] = 'committed'
             save()
         if state['phase'] == 'committed':
-            if not manager.LINUX and not (profile or {}).get('code_session'):
+            if manager.native_mac() and not (profile or {}).get('code_session'):
                 import openusage
                 openusage.delete_keychain_store(str(old / 'code'))
             state['phase'] = 'launcher'

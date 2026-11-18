@@ -127,6 +127,8 @@ if source.resolve() != target.resolve():
     shutil.copy2(source / 'storage.py', target / 'storage.py')
     shutil.copy2(source / 'profile_config.py', target / 'profile_config.py')
     shutil.copy2(source / 'upgrade.py', target / 'upgrade.py')
+    shutil.copy2(source / 'compat.py', target / 'compat.py')
+    shutil.copy2(source / 'windows_desktop.py', target / 'windows_desktop.py')
     shutil.copy2(source / 'native/launcher.m', target / 'native/launcher.m')
     shutil.copy2(source / 'README.md', target / 'README.md')
 for obsolete in ('chatsync', 'sync_links', 'sync_service'):
