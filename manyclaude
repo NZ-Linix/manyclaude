@@ -1,0 +1,1126 @@
+#!/usr/bin/env python3
+"""Small macOS/Linux Claude Desktop / Claude Code profile manager; stdlib only."""
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import tempfile
+import unicodedata
+from runtime import shell_quote
+
+VERSION = "1.13.0"
+LINUX = sys.platform.startswith("linux")
+
+
+def default_apps_dir():
+    if LINUX:
+        from linux_desktop import applications_dir
+        return str(applications_dir())
+    return "/Applications"
+
+
+def default_home():
+    if LINUX:
+        from linux_desktop import xdg_directory
+        return xdg_directory("XDG_DATA_HOME", ".local/share") / "manyclaude"
+    return Path.home() / "Library/Application Support/ManyClaude"
+
+
+def regular_desktop_data():
+    if LINUX:
+        from linux_desktop import regular_data
+        return regular_data()
+    return Path.home() / "Library/Application Support/Claude"
+
+BASE = Path(os.environ.get("MANYCLAUDE_HOME", default_home())).expanduser().absolute()
+ROOT = Path(__file__).resolve().parent
+START, END = "# >>> manyclaude >>>", "# <<< manyclaude <<<"
+AUTH_ENV = ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN_FILE_DESCRIPTOR", "CLAUDE_CODE_HOST_CREDS_FILE", "ANTHROPIC_PROFILE")
+PROFILE_DIR_ENV = ('CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'CLAUDE_USER_DATA_DIR')
+
+
+def slugify(name):
+    text = unicodedata.normalize("NFKD", name).encode("ascii", "ignore").decode().lower()
+    slug = re.sub(r"[^a-z0-9]+", "-", text).strip("-")
+    if not slug or len(slug) > 64:
+        raise ValueError("Choose a name containing letters/numbers (at most 64 in the command name).")
+    return slug
+
+
+def validate_name(name):
+    name = name.strip()
+    if not name or len(name) > 80 or any(c in name for c in '/:') or any(ord(c) < 32 or ord(c) == 127 for c in name):
+        raise ValueError("Use 1–80 characters; no slashes, colons, or control characters.")
+    slugify(name)
+    return name
+
+
+def alias_name(key, profile):
+    return profile.get("alias", "claude-" + key)
+
+
+def validate_alias(value, profiles, own_key=None, own_custom=None):
+    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,63}", value):
+        raise ValueError("Alias must start with a letter and contain only letters, numbers, - or _ (max 64).")
+    reserved = {"claude", "manyclaude", "alias", "unalias", "source", "cd", "exit", "exec", "eval",
+                "command", "builtin", "export", "read", "set", "unset", "test", "true", "false",
+                "if", "then", "else", "fi", "for", "while", "do", "done", "function", "time", "return",
+                "end", "begin", "switch", "case", "break", "continue", "and", "or", "not"}
+    import custom_profiles
+    from global_code import launcher_name
+    custom = custom_profiles.read(BASE)
+    existing = shutil.which(value)
+    own_command = existing == str(command_bin_dir() / value) and (
+        (own_key in profiles and alias_name(own_key, profiles[own_key]) == value)
+        or (own_custom in custom and custom[own_custom].get('command') == value))
+    if value in reserved or (existing and not own_command):
+        raise ValueError(f"'{value}' is already a system/shell command. Choose a different alias.")
+    for key, profile in profiles.items():
+        if key != own_key and alias_name(key, profile) == value:
+            raise ValueError(f"Alias '{value}' belongs to {profile['name']}.")
+    for key, item in custom.items():
+        if key != own_custom and item.get('command') == value:
+            raise ValueError(f"Command '{value}' belongs to the custom profile {item['name']}.")
+    if launcher_name(BASE) == value:
+        raise ValueError(f"Command '{value}' is the Global Claude Code command.")
+    return value
+
+
+def read_profiles():
+    file = BASE / "profiles.json"
+    return json.loads(file.read_text()) if file.exists() else {}
+
+
+def atomic_write(path, data, mode=0o600):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp = tempfile.mkstemp(dir=path.parent, prefix=".manyclaude-")
+    try:
+        with os.fdopen(fd, "wb") as out:
+            out.write(data if isinstance(data, bytes) else data.encode())
+        os.chmod(temp, mode)
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def save_profiles(profiles):
+    atomic_write(BASE / "profiles.json", json.dumps(profiles, indent=2) + "\n")
+
+
+def sync_openusage(exclude=(), enable=False, disable=False, quiet=False):
+    import openusage
+    try:
+        if quiet:
+            with (BASE / '.manager.lock').open('a+') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                messages = openusage.sync(sys.modules[__name__], exclude, enable, disable)
+        else:
+            messages = openusage.sync(sys.modules[__name__], exclude, enable, disable)
+    except (ValueError, OSError, subprocess.CalledProcessError):
+        if not quiet:
+            raise
+        print('OpenUsage sync failed; run manyclaude openusage to retry.', file=sys.stderr)
+        return
+    if not quiet:
+        print('\n'.join(messages))
+        print('OpenUsage export disabled.' if disable else 'Restart OpenUsage after adding/removing accounts.')
+
+
+def shell_rc():
+    shell = Path(os.environ.get("SHELL", "/bin/zsh")).name
+    if shell == "fish":
+        config = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+        if not config.is_absolute():
+            config = Path.home() / ".config"
+        return config / "fish/config.fish"
+    if shell not in ("zsh", "bash"):
+        raise ValueError("Automatic aliases support zsh/bash/fish. Use --rc with a supported startup file or --no-alias.")
+    return (Path(os.environ.get("ZDOTDIR", str(Path.home()))) / ".zshrc" if shell == "zsh"
+            else Path.home() / ".bashrc")
+
+
+def shell_block(text, replacement):
+    if START not in text and END not in text:
+        return text.rstrip("\n") + ("\n\n" if text else "") + replacement
+    if text.count(START) != 1 or text.count(END) != 1 or text.index(START) > text.index(END):
+        raise ValueError("Malformed manyclaude block in shell config; repair its markers first.")
+    return re.sub(re.escape(START) + r".*?" + re.escape(END) + r"\n?", lambda _: replacement, text, flags=re.S)
+
+
+def command_bin_dir():
+    config = ROOT / 'command-bin-dir'
+    return Path(config.read_text().strip()) if config.is_file() else Path.home() / '.local/bin'
+
+
+def profile_binary(key):
+    directory = ROOT if (ROOT / 'command-bin-dir').is_file() else BASE / 'bin'
+    return directory / ('manyclaude-code-' + key)
+
+
+def command_marker():
+    owner = hashlib.sha256((str(ROOT) + '\n' + str(BASE)).encode()).hexdigest()
+    return '#!/bin/sh\n# manyclaude profile launcher ' + owner + '\n'
+
+
+def sync_commands(profiles, dry_run=False):
+    from global_code import launcher_name
+    marker = command_marker()
+    desired = {}
+    global_name = launcher_name(BASE)
+    if global_name:
+        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
+                              str(ROOT / 'manyclaude'), 'global'])
+        desired[command_bin_dir() / global_name] = marker + 'exec ' + command + ' "$@"\n'
+    import custom_profiles
+    for key, item in custom_profiles.read(BASE).items():
+        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
+                              str(ROOT / 'manyclaude'), 'custom-run', key])
+        path = command_bin_dir() / item['command']
+        if path in desired:
+            raise ValueError(f'ManyClaude command collision: {path}')
+        desired[path] = marker + 'exec ' + command + ' "$@"\n'
+    for key, profile in profiles.items():
+        command = shlex.join(['env', 'MANYCLAUDE_HOME=' + str(BASE), sys.executable,
+                              str(ROOT / 'manyclaude'), 'code', key])
+        content = marker + 'exec ' + command + ' "$@"\n'
+        paths = [profile_binary(key)]
+        if not profile.get('regular'):
+            paths.append(command_bin_dir() / alias_name(key, profile))
+        for path in paths:
+            if path in desired:
+                raise ValueError(f'ManyClaude command collision: {path}')
+            desired[path] = content
+    directories = {command_bin_dir(), profile_binary('unused').parent}
+    stale = []
+    for directory in directories:
+        if directory.exists():
+            for path in directory.iterdir():
+                if path.is_file() and not path.is_symlink():
+                    with path.open('rb') as stream:
+                        owned = stream.read(len(marker.encode())) == marker.encode()
+                    if owned and path not in desired:
+                        stale.append(path)
+    for path in desired:
+        if path.exists() or path.is_symlink():
+            if path.is_symlink() or not path.is_file():
+                raise ValueError(f'Refusing to overwrite an unrelated command: {path}')
+            with path.open('rb') as stream:
+                if stream.read(len(marker.encode())) != marker.encode():
+                    raise ValueError(f'Refusing to overwrite an unrelated command: {path}')
+    if not dry_run:
+        for path, content in desired.items():
+            atomic_write(path, content, 0o755)
+        for path in stale:
+            path.unlink()
+
+
+def sync_aliases(profiles, extra=(), dry_run=False):
+    normalized = {key: str(Path(p["rc"]).expanduser().absolute().resolve())
+                  for key, p in profiles.items() if p.get("rc")}
+    files = {str(Path(p).expanduser().absolute().resolve()) for p in extra} | set(normalized.values())
+    updates = []
+    for filename in files:
+        rc = Path(filename).expanduser().absolute().resolve()
+        fish = rc.suffix == '.fish'
+        executable = shell_quote(ROOT / "manyclaude", fish)
+        text = rc.read_text() if rc.exists() else ""
+        outside = shell_block(text, "")
+        for key in profiles:
+            if normalized.get(key) != str(rc):
+                continue
+            name = alias_name(key, profiles[key])
+            conflict = re.search(r"(?m)^\s*(?:alias\s+['\"]?" + re.escape(name) + r"=|(?:function\s+)?" + re.escape(name) + r"\s*\(\s*\))", outside)
+            if fish:
+                conflict = (conflict or re.search(r"(?m)^\s*(?:alias|function)\s+['\"]?" + re.escape(name) + r"(?:['\"]?(?:\s|=|$))", outside)
+                            or (rc.parent / 'functions' / (name + '.fish')).exists())
+            if conflict:
+                raise ValueError(f"'{name}' is already defined outside the managed block in {rc}.")
+        lines = [(f"function {alias_name(key, profiles[key])}\n    {executable} code {key} $argv\nend" if fish
+                  else f"alias {alias_name(key, profiles[key])}={shlex.quote(executable + ' code ' + key)}")
+                 for key in sorted(profiles) if normalized.get(key) == str(rc) and profiles[key].get('regular')]
+        if any(normalized.get(key) == str(rc) and not p.get('regular') for key, p in profiles.items()):
+            directory = shell_quote(command_bin_dir(), fish)
+            lines.insert(0, 'fish_add_path --path ' + directory if fish else 'export PATH=' + directory + ':"$PATH"')
+        block = START + "\n" + "\n".join(lines) + "\n" + END + "\n" if lines else ""
+        updated = shell_block(text, block)
+        if updated != text:
+            updates.append((rc, updated))
+    sync_commands(profiles, dry_run=True)
+    if not dry_run:
+        sync_commands(profiles)
+        for rc, updated in updates:
+            if rc.exists():
+                backup = rc.with_name(rc.name + ".manyclaude.bak")
+                shutil.copy2(rc, backup)
+            atomic_write(rc, updated, rc.stat().st_mode & 0o777 if rc.exists() else 0o644)
+
+
+def source_app(path=None):
+    if LINUX:
+        from linux_desktop import source_app as linux_source
+        return linux_source(path)
+    candidates = [Path(path).expanduser()] if path else [Path("/Applications/Claude.app"), Path.home() / "Applications/Claude.app"]
+    for app in candidates:
+        if (app / "Contents/Info.plist").is_file():
+            info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+            binary = app / "Contents/MacOS" / info.get("CFBundleExecutable", "Claude")
+            if binary.is_file() and not info.get("ManyClaudeProfile"):
+                return app.absolute()
+    raise ValueError("Install Claude Desktop in /Applications, or pass --claude-app /path/to/Claude.app.")
+
+
+def native_launcher():
+    binary = ROOT / "native/launcher"
+    source = ROOT / "native/launcher.m"
+    if not binary.exists() or source.stat().st_mtime > binary.stat().st_mtime:
+        if not shutil.which("clang"):
+            raise ValueError("Install Apple's Command Line Tools with: xcode-select --install")
+        subprocess.run(["clang", "-fobjc-arc", "-O2", "-framework", "AppKit", str(source), "-o", str(binary)], check=True)
+    return binary
+
+
+def prepare_skills(profile):
+    """Expose regular user skills without sharing account-owned synced skills."""
+    if profile.get('regular'):
+        return
+    source = Path.home() / '.claude/skills'
+    directory = Path(profile['code'])
+    target = directory / 'skills'
+    if target.resolve() == source.resolve():
+        return
+    # Desktop writes account-specific data under skills/synced.
+    if target.is_symlink():
+        raise ValueError(f'Refusing to change a redirected skills folder: {target}')
+    target.mkdir(parents=True, exist_ok=True, mode=0o700)
+    shared = {entry.name: entry for entry in source.iterdir()
+              if not entry.name.startswith('.') and entry.name != 'synced' and entry.is_dir()} if source.is_dir() else {}
+    # Identify only our direct links, including dangling ones after uninstall.
+    for entry in target.iterdir():
+        if entry.is_symlink() and entry.readlink() == source / entry.name and entry.name not in shared:
+            try:
+                entry.unlink()
+            except FileNotFoundError:
+                pass
+    for name, entry in shared.items():
+        try:
+            (target / name).symlink_to(entry, target_is_directory=True)
+        except FileExistsError:
+            # A profile-local skill (or a user-managed link) wins a name conflict.
+            pass
+
+
+def sync_config(action=None):
+    import profile_config
+    state = BASE / profile_config.STATE
+    if action == 'disable':
+        state.unlink(missing_ok=True)
+        print('Configuration sync disabled. Current profile configuration kept.')
+        return
+    if not state.exists() and action != 'enable':
+        if action == 'now':
+            raise ValueError('Enable configuration sync with manyclaude sync-config --enable.')
+        print('Configuration sync is off.')
+        return
+    if action == 'status':
+        print('Configuration sync is on.')
+        return
+    conflicts = profile_config.sync(sys.modules[__name__], enable=action == 'enable')
+    if conflicts:
+        print('manyclaude: configuration conflicts resolved in profile order: ' + ', '.join(conflicts),
+              file=sys.stderr)
+    if action:
+        print('Profile configuration synced. Sync runs before launches through ManyClaude.')
+
+
+def prepare_profile(profile):
+    from profile_config import STATE
+    if (BASE / STATE).exists():
+        with (BASE / '.manager.lock').open('a+') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            sync_config()
+    prepare_skills(profile)
+
+
+def build_app(key, profile):
+    prepare_skills(profile)
+    if LINUX:
+        import linux_desktop
+        return linux_desktop.build_app(sys.modules[__name__], key, profile)
+    target = Path(profile["app"])
+    if target.exists():
+        info_file = target / "Contents/Info.plist"
+        info = plistlib.loads(info_file.read_bytes()) if info_file.exists() else {}
+        if info.get("ManyClaudeProfile") != str(BASE / "profiles" / key):
+            raise ValueError(f"Refusing to overwrite an app not owned by this profile: {target}")
+    source = source_app(profile["source"])
+    source_info = plistlib.loads((source / 'Contents/Info.plist').read_bytes())
+    executable = source_info.get('CFBundleExecutable', 'Claude')
+    launcher = native_launcher()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".manyclaude-", dir=target.parent) as temp:
+        staged = Path(temp) / target.name
+        contents = staged / "Contents"
+        # APFS shares unchanged blocks. The signed canonical app remains untouched.
+        copied = subprocess.run(['/bin/cp', '-cR', str(source), str(staged)], capture_output=True)
+        if copied.returncode:
+            shutil.rmtree(staged, ignore_errors=True)
+            shutil.copytree(source, staged, symlinks=True)
+        (contents / "MacOS").mkdir(parents=True, exist_ok=True)
+        resources = contents / "Resources"
+        resources.mkdir(exist_ok=True)
+        shutil.copy2(launcher, contents / "MacOS/ManyClaude")
+        app_name = profile.get('app_name', 'Claude ' + profile['name'])
+        info = dict(source_info)
+        # Preserve the original asset catalog and icon declarations. Flattening an
+        # NSWorkspace-rendered icon bakes lighting into a second Dock rendering.
+        info.update(CFBundleName=source_info.get('CFBundleName', 'Claude'), CFBundleDisplayName=app_name,
+                    CFBundleIdentifier="local.manyclaude.p" + hashlib.sha256(str(BASE).encode()).hexdigest()[:8] + "." + key,
+                    CFBundleExecutable="ManyClaude", CFBundlePackageType="APPL",
+                    CFBundleShortVersionString=source_info.get('CFBundleShortVersionString', VERSION),
+                    CFBundleVersion=source_info.get('CFBundleVersion', '1'), LSUIElement=False,
+                    NSHighResolutionCapable=True, ManyClaudeSource=str(source),
+                    ManyClaudeProfile=str(BASE / "profiles" / key), ManyClaudeDesktop=profile["desktop"], ManyClaudeCode=profile["code"],
+                    ManyClaudeRuntime='Contents/MacOS/' + executable,
+                    ManyClaudeTool=str(ROOT / 'manyclaude'), ManyClaudeKey=key, ManyClaudeHome=str(BASE),
+                    ManyClaudeSourceVersion=source_info.get('CFBundleVersion', ''),
+                    ManyClaudeSourceMTime=str((source / 'Contents/MacOS' / executable).stat().st_mtime_ns))
+        (contents / "Info.plist").write_bytes(plistlib.dumps(info))
+        # A locally signed runtime cannot claim Anthropic's restricted signing identity.
+        signed = subprocess.run(['/usr/bin/codesign', '-d', '--entitlements', ':-', str(source)], capture_output=True)
+        if signed.returncode == 0:
+            entitlements = plistlib.loads(signed.stdout) if signed.stdout.strip() else {}
+            for entitlement in ('com.apple.application-identifier', 'com.apple.developer.team-identifier', 'keychain-access-groups'):
+                entitlements.pop(entitlement, None)
+            entitlements['com.apple.security.cs.disable-library-validation'] = True
+            entitlement_file = Path(temp) / 'entitlements.plist'
+            entitlement_file.write_bytes(plistlib.dumps(entitlements))
+            subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', '--options', 'runtime',
+                            '--entitlements', str(entitlement_file), str(contents / 'MacOS' / executable)], check=True, capture_output=True)
+        else:
+            subprocess.run(['/usr/bin/codesign', '--force', '--sign', '-', str(contents / 'MacOS' / executable)],
+                           check=True, capture_output=True)
+        subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(staged)], check=True, capture_output=True)
+        if running(profile):
+            raise ValueError('Quit this profile’s Claude Desktop before refreshing its app.')
+        if target.exists():
+            shutil.rmtree(target)
+        staged.rename(target)
+        subprocess.run(['/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister',
+                        '-f', str(target)], check=True, capture_output=True)
+
+
+def add(args):
+    name = validate_name(args.name)
+    key = slugify(name)
+    profiles = read_profiles()
+    if key in profiles:
+        raise ValueError(f"Profile '{key}' already exists. Use manyclaude refresh {key}.")
+    from profile_config import forget_profile
+    if args.regular:
+        if args.app_name:
+            raise ValueError('--app-name applies only to isolated profiles; the regular app keeps its name.')
+        if args.alias or args.rc or args.no_alias:
+            raise ValueError('--regular uses the normal claude command; alias options do not apply.')
+        if any(p.get('regular') for p in profiles.values()):
+            raise ValueError('A regular Claude profile already exists. Only one can use the normal setup.')
+        source = source_app(args.claude_app)
+        profiles[key] = dict(name=name, regular=True, app=str(source), source=str(source),
+                             desktop=str(regular_desktop_data()),
+                             code=str(Path.home() / '.claude'), alias='claude', rc=None)
+        forget_profile(sys.modules[__name__], key)
+        sync_commands(profiles)
+        save_profiles(profiles)
+        print(f'Registered {name} using {source} and the regular claude command. Existing data kept.')
+        return
+    alias = validate_alias(args.alias or 'claude-' + key, profiles)
+    app_name = validate_name(args.app_name) if args.app_name is not None else 'Claude ' + name
+    app = Path(args.apps_dir).expanduser().absolute() / (f"manyclaude-{key}.desktop" if LINUX else f"{app_name}.app")
+    if app.exists():
+        raise ValueError(f"App already exists: {app}")
+    rc = None if args.no_alias else str(Path(args.rc).expanduser().absolute().resolve() if args.rc else shell_rc().resolve())
+    # Validate shell file before creating the app.
+    if rc:
+        shell_block(Path(rc).read_text() if Path(rc).exists() else "", "")
+    from storage import profile_dir, safe_path
+    directory = profile_dir(key)
+    safe_path(directory)
+    profile = dict(name=name, app=str(app), source=str(source_app(args.claude_app)),
+                   desktop=str(directory / "desktop"), code=str(directory), rc=rc, alias=alias, app_name=app_name)
+    for folder in (directory, directory / "desktop"):
+        folder.mkdir(parents=True, exist_ok=True, mode=0o700)
+    build_app(key, profile)
+    profiles[key] = profile
+    try:
+        forget_profile(sys.modules[__name__], key)
+        sync_aliases(profiles)
+    except Exception:
+        app.unlink() if LINUX else shutil.rmtree(app)
+        raise
+    save_profiles(profiles)
+    print(f"\nCreated {name}\n  Desktop: {app}\n  Code:    {alias}\n  Data:    {directory}")
+    if rc:
+        print(f"\nOpen a new terminal or run: source {shell_quote(rc, Path(rc).suffix == '.fish')}")
+    print(f"Sign in separately in Desktop and in: manyclaude code {key}")
+
+
+def get_profile(name):
+    key = slugify(name)
+    profiles = read_profiles()
+    if key not in profiles:
+        raise ValueError(f"Unknown profile '{name}'. Run manyclaude list.")
+    return key, profiles[key]
+
+
+def rename_alias(name, new_alias):
+    key, profile = get_profile(name)
+    if profile.get('regular'):
+        raise ValueError('The regular Claude profile uses the normal claude command; its alias cannot be renamed.')
+    profiles = read_profiles()
+    old_alias = alias_name(key, profile)
+    profile['alias'] = validate_alias(new_alias, profiles, key)
+    profiles[key] = profile
+    sync_aliases(profiles)
+    save_profiles(profiles)
+    print(f"{profile['name']}: {old_alias} → {new_alias}")
+    if profile.get('rc'):
+        print(f"Executable: {command_bin_dir() / new_alias}. Restart existing shells to clear cached commands or old aliases.")
+    else:
+        print(f"Executable: {command_bin_dir() / new_alias}")
+
+
+def parse_code_alias(name, rc):
+    """Read a simple env/claude alias as data; never execute shell config."""
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]*', name):
+        raise ValueError('Use a simple shell alias name.')
+    text = Path(rc).expanduser().read_text()
+    match = re.search(r'(?m)^\s*alias\s+' + re.escape(name) + r'=', text)
+    if not match:
+        raise ValueError(f"Alias '{name}' was not found in {rc}.")
+    lexer = shlex.shlex(text[match.end():], posix=True)
+    lexer.whitespace_split = True
+    body = lexer.get_token()
+    if not body or '$(' in body or '`' in body:
+        raise ValueError('Only a simple env/claude alias is supported; shell execution is not supported.')
+    words = shlex.split(body.replace('\\\n', ''))
+    if words and words[0] == 'env':
+        words.pop(0)
+    variables = {}
+    while words and re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', words[0]):
+        key, value = words.pop(0).split('=', 1)
+        variables[key] = os.path.expandvars(value)
+    if not words or words.pop(0) != 'claude' or any(w in (';', '&&', '||', '|', '>', '<') for w in words):
+        raise ValueError('Alias must contain optional env assignments, then claude and its flags.')
+    return variables, [os.path.expandvars(word) for word in words]
+
+
+def code_options(name, variables=None, flags=None, from_alias=None, rc=None, clear=False, trust_folders=None,
+                 allow_external_imports=None):
+    key, profile = get_profile(name)
+    env, arguments = {}, []
+    if from_alias:
+        env, arguments = parse_code_alias(from_alias, rc or shell_rc())
+    if variables is not None:
+        for assignment in variables:
+            if not re.match(r'^[A-Za-z_][A-Za-z0-9_]*=', assignment):
+                raise ValueError('Environment variables must use KEY=VALUE.')
+            field, value = assignment.split('=', 1)
+            env[field] = value
+    if flags is not None:
+        arguments = shlex.split(flags)
+    protected = set(AUTH_ENV) | {'CLAUDE_CONFIG_DIR', 'CLAUDE_SECURESTORAGE_CONFIG_DIR', 'CLAUDE_USER_DATA_DIR'}
+    if protected.intersection(env):
+        raise ValueError('Profile credentials/config directories cannot be overridden in saved Code defaults.')
+    profiles = read_profiles()
+    if clear:
+        profiles[key].pop('code_env', None)
+        profiles[key].pop('code_args', None)
+        profiles[key].pop('trust_folders', None)
+        profiles[key].pop('allow_external_imports', None)
+    elif (from_alias or variables is not None or flags is not None or trust_folders is not None
+          or allow_external_imports is not None):
+        profiles[key]['code_env'] = env if from_alias or variables is not None else profile.get('code_env', {})
+        profiles[key]['code_args'] = arguments if from_alias or flags is not None else profile.get('code_args', [])
+        if trust_folders is not None:
+            profiles[key]['trust_folders'] = trust_folders
+        if allow_external_imports is not None:
+            profiles[key]['allow_external_imports'] = allow_external_imports
+    else:
+        print(json.dumps({'env': profile.get('code_env', {}), 'flags': profile.get('code_args', []),
+                          'trust_folders': profile.get('trust_folders', False),
+                          'allow_external_imports': profile.get('allow_external_imports', False)}, indent=2))
+        return
+    if profile.get('regular'):
+        old_rc = profile.get('rc')
+        has_defaults = any(profiles[key].get(field) for field in
+                           ('code_env', 'code_args', 'trust_folders', 'allow_external_imports'))
+        profiles[key]['rc'] = str(shell_rc().resolve()) if has_defaults else None
+        sync_aliases(profiles, [old_rc] if old_rc else [])
+    save_profiles(profiles)
+    print(f"Saved Code defaults for {profile['name']}. Its command forwards additional flags unchanged.")
+    if profile.get('regular'):
+        rc = profiles[key].get('rc') or old_rc or shell_rc()
+        print('Reload your shell to update the claude alias: source ' + shell_quote(rc, Path(rc).suffix == '.fish'))
+
+
+def configure_code_project(profile):
+    trust_folders = profile.get('trust_folders')
+    allow_external_imports = profile.get('allow_external_imports')
+    if not (trust_folders or allow_external_imports):
+        return
+    directory = Path.home() / '.claude' if profile.get('regular') else Path(profile['code'])
+    legacy = directory / '.config.json'
+    config = legacy if legacy.exists() else (Path.home() / '.claude.json' if profile.get('regular') else directory / '.claude.json')
+    cwd = Path.cwd()
+    project_root = cwd.resolve()
+    paths = {str(cwd), str(project_root)}
+    logical = os.environ.get('PWD')
+    if logical and Path(logical).resolve() == project_root:
+        paths.add(str(Path(logical).absolute()))
+    if shutil.which('git'):
+        result = subprocess.run(['git', 'rev-parse', '--show-toplevel'], capture_output=True, text=True)
+        if result.returncode == 0:
+            project_root = Path(result.stdout.rstrip('\n')).resolve()
+            paths.add(str(project_root))
+            if allow_external_imports and (project_root / '.git').is_file():
+                # Claude stores external import approval under the main checkout for linked worktrees.
+                result = subprocess.run(['git', 'rev-parse', '--path-format=absolute', '--git-common-dir'],
+                                        capture_output=True, text=True)
+                if result.returncode == 0:
+                    common_dir = Path(result.stdout.rstrip('\n')).resolve()
+                    if common_dir.name == '.git' and common_dir.is_dir():
+                        project_root = common_dir.parent
+    updates = {path: {'hasTrustDialogAccepted': True} for path in paths} if trust_folders else {}
+    if allow_external_imports:
+        updates.setdefault(str(project_root), {}).update(hasClaudeMdExternalIncludesApproved=True,
+                                                        hasClaudeMdExternalIncludesWarningShown=True)
+    with (BASE / '.manager.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        data = json.loads(config.read_text()) if config.exists() else {}
+        projects = data.setdefault('projects', {})
+        changed = False
+        for path, settings in updates.items():
+            project = projects.setdefault(path, {})
+            if any(project.get(field) is not value for field, value in settings.items()):
+                project.update(settings)
+                changed = True
+        if changed:
+            backup = config.with_name(config.name + '.manyclaude-trust.bak')
+            if config.exists() and not backup.exists():
+                shutil.copy2(config, backup)
+            atomic_write(config, json.dumps(data, indent=2) + '\n')
+
+
+def code_environment(profile, env, *, own_login=False):
+    env = {**profile.get('code_env', {}), **env}
+    if own_login or not profile.get('regular'):
+        for variable in AUTH_ENV:
+            env.pop(variable, None)
+    if own_login or profile.get('regular'):
+        for variable in PROFILE_DIR_ENV:
+            env.pop(variable, None)
+    if not profile.get('regular'):
+        env.update(CLAUDE_CONFIG_DIR=profile['code'],
+                   CLAUDE_SECURESTORAGE_CONFIG_DIR=profile.get('code_session', profile['code']))
+    return env
+
+
+def code(name, arguments, *, own_login=False, global_session=None, runner=None, session_directory=None,
+         extra_env=None):
+    if (BASE / 'openusage-enabled').exists():
+        sync_openusage(quiet=True)
+    key, profile = get_profile(name)
+    prepare_profile(profile)
+    from runtime import claude_command, is_claude_subcommand
+    binary, env = claude_command()
+    try:
+        configure_code_project(profile if session_directory is None else
+                               {**profile, 'code': str(session_directory), 'regular': False})
+    except PermissionError as error:
+        # Let Claude handle startup when the config or backup is unwritable.
+        path = error.filename or 'Claude configuration'
+        action = 'trust this folder' if profile.get('trust_folders') else 'allow external imports'
+        if profile.get('trust_folders') and profile.get('allow_external_imports'):
+            action += ' or allow external imports'
+        print(f'manyclaude: could not automatically {action}: permission denied: {path}. '
+              'Check the file ownership and permissions; continuing to Claude.',
+              file=sys.stderr)
+    # Custom-profile variables act like saved defaults: the caller's environment still wins.
+    env = code_environment(profile, {**(extra_env or {}), **env}, own_login=own_login)
+    if session_directory is not None:
+        env.update(CLAUDE_CONFIG_DIR=str(session_directory),
+                   CLAUDE_SECURESTORAGE_CONFIG_DIR='' if profile.get('regular') else
+                   profile.get('code_session', profile['code']))
+    defaults = profile.get('code_args', [])
+    # Session flags can consume a subcommand or change how Claude dispatches it.
+    if defaults and not (arguments and is_claude_subcommand(binary, env, arguments[0])):
+        if '--restricted' in arguments:
+            defaults = [arg for arg in defaults if arg != '--dangerously-skip-permissions']
+        arguments = [*defaults, *arguments]
+    if global_session is not None:
+        arguments = global_session(arguments)
+    if runner is not None or (BASE / 'openusage-enabled').exists():
+        try:
+            command = [binary, *arguments]
+            result = runner(command, env) if runner else subprocess.run(command, env=env).returncode
+        finally:
+            if (BASE / 'openusage-enabled').exists():
+                sync_openusage(quiet=True)
+        raise SystemExit(result if result >= 0 else 128 - result)
+    os.execvpe(binary, [binary, *arguments], env)
+
+
+def code_command(name, arguments):
+    """Profile commands: `--convo FILE.jsonl` runs that conversation in a private store."""
+    from convo_file import ConvoFile, take
+    path, arguments = take(arguments)
+    if path is None:
+        return code(name, arguments)
+    from global_code import session_store
+    key, profile = get_profile(name)
+    convo = ConvoFile(path, key)
+    store = session_store(sys.modules[__name__], profile, convo.store_name, Path(profile['code']) / 'settings.json')
+    return code(key, convo.prepare(store, arguments), session_directory=store, runner=convo.runner())
+
+
+def desktop(name):
+    key, profile = get_profile(name)
+    if LINUX:
+        import linux_desktop
+        if not profile.get("regular") and not Path(profile["app"]).exists():
+            raise ValueError("Profile launcher is missing. Run manyclaude refresh.")
+        return linux_desktop.launch(sys.modules[__name__], key, profile, background=True)
+    if not Path(profile["app"]).exists():
+        raise ValueError("Profile app is missing. Run manyclaude refresh.")
+    if profile.get('regular'):
+        prepare_profile(profile)
+    subprocess.run(["/usr/bin/open", profile["app"]], check=True)
+
+
+def listing():
+    profiles = read_profiles()
+    if not profiles:
+        print("No profiles yet. Run manyclaude to create one.")
+    for key, p in profiles.items():
+        print(f"{p['name']} ({key})" + (' · regular Claude' if p.get('regular') else '') +
+              f"\n  {p['app']}\n  {alias_name(key, p)}\n  Code command: {shlex.quote(str(ROOT / 'manyclaude'))} code {shlex.quote(key)}"
+              f"\n  Code binary: {profile_binary(key)}" +
+              (f"\n  Named binary: {command_bin_dir() / alias_name(key, p)}" if not p.get('regular') else '') +
+              f"\n  Desktop data: {p['desktop']}\n  Code data: {p['code']}\n")
+
+
+def refresh(name=None):
+    profiles = read_profiles()
+    keys = [get_profile(name)[0]] if name else list(profiles)
+    for key in keys:
+        if profiles[key].get('regular'):
+            source_app(profiles[key]['source'])
+            print(f"{profiles[key]['name']} uses the regular app; no launcher to rebuild.")
+            continue
+        build_app(key, profiles[key])
+        print(f"Refreshed {profiles[key]['name']}")
+    sync_aliases(profiles)
+
+
+def running(profile):
+    if LINUX:
+        from linux_desktop import running as linux_running
+        return linux_running(profile)
+    if profile.get('regular'):
+        executable = str(Path(profile['app']) / 'Contents/MacOS/')
+        result = subprocess.run(['/bin/ps', '-ax', '-o', 'command='], capture_output=True, text=True, check=True)
+        return any(line.startswith(executable) and '--type=' not in line and '--user-data-dir=' not in line
+                   for line in result.stdout.splitlines())
+    path = Path(profile["desktop"]).parent / "desktop.lock"
+    if not path.exists():
+        return False
+    with path.open("a+") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return False
+        except BlockingIOError:
+            return True
+
+
+def reset_paths(key, profile):
+    if profile.get('regular'):
+        home = Path.home()
+        paths = [home / 'Library/Application Support/Claude', home / 'Library/Application Support/Claude-3p',
+                 home / '.claude', home / '.claude.json', home / 'Library/Logs/Claude',
+                 home / 'Library/Logs/Claude-3p', home / 'Library/Caches/com.anthropic.claudefordesktop',
+                 home / 'Library/Preferences/com.anthropic.claudefordesktop.plist',
+                 home / 'Library/Saved Application State/com.anthropic.claudefordesktop.savedState']
+        if LINUX:
+            from linux_desktop import xdg_directory
+            paths = [regular_desktop_data(), home / '.claude', home / '.claude.json',
+                     xdg_directory('XDG_CACHE_HOME', '.cache') / 'Claude']
+        paths += list(home.glob('.claude.json.backup*'))
+        if profile['code'] != str(home / '.claude') or profile['desktop'] != str(paths[0]):
+            raise ValueError('Regular profile has unexpected data paths. Refusing to reset.')
+        return paths
+    from storage import profile_dir
+    directory = profile_dir(key)
+    if profile['code'] != str(directory) or profile['desktop'] != str(directory / 'desktop'):
+        raise ValueError('Profile has unexpected data paths. Refusing to reset.')
+    if any(Path(profile[field]).is_symlink() for field in ('code', 'desktop')):
+        raise ValueError('Refusing to reset redirected profile data folders.')
+    from storage import safe_path
+    safe_path(directory)
+    backup = Path.home() / '.manyclaude-storage-backup' / key
+    safe_path(backup)
+    return [directory, backup] if backup.exists() else [directory]
+
+
+def reset_data(name):
+    key, profile = get_profile(name)
+    paths = reset_paths(key, profile)
+    if profile.get('regular'):
+        if LINUX and any(running(p) for p in read_profiles().values()):
+            raise ValueError('Quit all Claude Desktop instances before resetting the regular profile.')
+        executables = {str(Path(p['app']) / 'Contents/MacOS/') for p in read_profiles().values()}
+        result = subprocess.run(['/bin/ps', '-ax', '-o', 'uid=,command='], capture_output=True, text=True, check=True)
+        commands = [parts[1] for line in result.stdout.splitlines()
+                    if len(parts := line.strip().split(None, 1)) == 2 and parts[0] == str(os.getuid())]
+        if any(any(line.startswith(executable) for executable in executables) and '--type=' not in line for line in commands):
+            raise ValueError('Quit all Claude Desktop instances before resetting the regular profile.')
+        if any(re.search(r'(?:^|/)claude(?:\s|$)|/claude/versions/|@anthropic-ai/claude-code/', line) for line in commands):
+            raise ValueError('Quit all Claude Code sessions before resetting the regular profile.')
+    elif running(profile):
+        raise ValueError('Quit this profile’s Claude Desktop before resetting it.')
+    # Prevent a redirected parent folder from turning reset into deletion outside its intended root.
+    root = Path.home().resolve()
+    unresolved_root = Path.home()
+    for path in paths:
+        if LINUX and profile.get('regular'):
+            from linux_desktop import xdg_directory
+            roots = [Path.home(), xdg_directory('XDG_CONFIG_HOME', '.config'), xdg_directory('XDG_CACHE_HOME', '.cache')]
+            parent = next((r for r in roots if path.is_relative_to(r)), None)
+            if parent is None or parent.is_symlink():
+                raise ValueError(f'Refusing to clear a redirected data path: {path}')
+            expected = parent.resolve() / path.relative_to(parent)
+        else:
+            expected = root / path.relative_to(unresolved_root)
+        if path.is_symlink() or path.resolve() != expected:
+            raise ValueError(f'Refusing to clear a redirected data path: {path}')
+    service = 'Claude Code-credentials'
+    if not profile.get('regular'):
+        service += '-' + hashlib.sha256(unicodedata.normalize('NFC', profile['code']).encode()).hexdigest()[:8]
+    if (BASE / 'openusage-enabled').exists():
+        sync_openusage(exclude=(key,))
+    from profile_config import forget_profile
+    forget_profile(sys.modules[__name__], key)
+    if not LINUX:
+        result = subprocess.run(['/usr/bin/security', 'delete-generic-password', '-s', service], capture_output=True, text=True)
+        if result.returncode not in (0, 44):
+            raise ValueError('Could not remove Code Keychain credentials: ' + result.stderr.strip())
+    for path in paths:
+        if path.is_dir():
+            shutil.rmtree(path)
+        elif path.exists():
+            path.unlink()
+    if not profile.get('regular'):
+        for path in (Path(profile['desktop']), Path(profile['code'])):
+            path.mkdir(parents=True, exist_ok=True, mode=0o700)
+    print(f"Reset {profile['name']}. App and command kept; local logins, settings, and history cleared.")
+
+
+def remove(name, purge=False):
+    key, profile = get_profile(name)
+    if profile.get('regular'):
+        if purge:
+            reset_data(name)
+        profiles = read_profiles()
+        if (BASE / 'openusage-enabled').exists():
+            sync_openusage(exclude=(key,))
+            profiles = read_profiles()
+        del profiles[key]
+        sync_aliases(profiles, [profile['rc']] if profile.get('rc') else [])
+        save_profiles(profiles)
+        print(f"Unregistered {profile['name']}. The regular Claude app and command are still installed.")
+        return
+    if running(profile):
+        raise ValueError("Quit this profile's Claude Desktop before removing it.")
+    profiles = read_profiles()
+    del profiles[key]
+    app = Path(profile["app"])
+    if app.exists() or app.is_symlink():
+        if LINUX:
+            from linux_desktop import owned
+            owned(sys.modules[__name__], key, app)
+        else:
+            info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+            if info.get("ManyClaudeProfile") != str(BASE / "profiles" / key):
+                raise ValueError(f"Refusing to remove an app not owned by this profile: {app}")
+    from storage import profile_dir
+    directory = profile_dir(key)
+    extra_rc = [profile['rc']] if profile.get('rc') else []
+    sync_aliases(profiles, extra_rc, dry_run=True)
+    if (BASE / 'openusage-enabled').exists():
+        sync_openusage(exclude=(key,))
+        profiles = read_profiles()
+        del profiles[key]
+    if purge:
+        if directory.is_symlink() or directory.resolve() != (Path.home().resolve() / directory.name):
+            raise ValueError('Refusing to delete a profile folder redirected outside ManyClaude.')
+        data_paths = reset_paths(key, profile)
+        # Login tokens on macOS live in a profile-specific Keychain service.
+        if not LINUX:
+            digest = hashlib.sha256(unicodedata.normalize('NFC', profile['code']).encode()).hexdigest()[:8]
+            result = subprocess.run(['/usr/bin/security', 'delete-generic-password', '-s',
+                                     'Claude Code-credentials-' + digest], capture_output=True, text=True)
+            if result.returncode not in (0, 44):  # errSecItemNotFound is harmless for a never-used profile.
+                raise ValueError('Could not remove the profile Keychain credential: ' + result.stderr.strip())
+    sync_aliases(profiles, extra_rc)
+    if app.exists():
+        if LINUX:
+            app.unlink()
+            from linux_desktop import refresh_database
+            refresh_database(app.parent)
+        else:
+            shutil.rmtree(app)
+    if purge:
+        for path in data_paths:
+            if path.exists():
+                shutil.rmtree(path)
+        save_profiles(profiles)
+        print(f"Removed {profile['name']}'s app, alias, and profile data.")
+    else:
+        save_profiles(profiles)
+        print(f"Removed {profile['name']}'s app and alias. Login/settings data kept at {directory}")
+
+
+def wizard():
+    if not sys.stdin.isatty():
+        raise ValueError('The wizard needs a terminal. Use: manyclaude create "Personal"')
+    import curses
+    from tui import ProfileUI
+    curses.wrapper(lambda screen: ProfileUI(screen, sys.modules[__name__]).run())
+
+
+def ensure_storage(check=False):
+    from storage import migrate
+    BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with (BASE / '.manager.lock').open('a+') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        migrate(sys.modules[__name__], check=check)
+
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ['_acp-code']:
+        from acp import code as acp_code
+        return acp_code(argv[1], argv[2:])
+    # Native Dock/Finder launches bypass the CLI. Prepare configuration without running
+    # storage migration, which can itself rebuild an app during startup.
+    if argv[:1] == ['_prepare-skills']:
+        if len(argv) != 2:
+            raise ValueError('Invalid Desktop skill preparation invocation.')
+        _, profile = get_profile(argv[1])
+        return prepare_profile(profile)
+    # Desktop entries use this internal foreground runner; keep it out of user help.
+    if argv[:1] == ['_desktop-run']:
+        if not LINUX or len(argv) != 2:
+            raise ValueError('Invalid Linux desktop launcher invocation.')
+        ensure_storage()
+        import linux_desktop
+        key, profile = get_profile(argv[1])
+        return linux_desktop.launch(sys.modules[__name__], key, profile)
+    if argv[:1] == ['_global-status']:
+        from global_code import status_line
+        return status_line(sys.modules[__name__], *argv[1:])
+    if argv[:1] == ['_global-selection']:
+        # Older running sessions still call this hook with routing-only model IDs.
+        from global_code import json_object
+        model = json_object(sys.stdin.read()).get('requested_model')
+        if isinstance(model, str) and re.fullmatch(r'manyclaude-route-[0-9]+', model):
+            print('Restart glaude to use the updated picker. This session is still open.', file=sys.stderr)
+            raise SystemExit(2)
+        return
+    if argv[:1] == ['global']:
+        from global_code import launch
+        if argv[1:] not in (['--help'], ['-h']):
+            ensure_storage()
+        return launch(sys.modules[__name__], argv[1:])
+    if argv[:1] == ['custom-run']:
+        if len(argv) < 2:
+            raise ValueError('Expected manyclaude custom-run <custom profile> [arguments].')
+        import custom_profiles
+        ensure_storage()
+        return custom_profiles.run(sys.modules[__name__], argv[1], argv[2:])
+    parser = argparse.ArgumentParser(description="Separate Claude accounts on macOS and Linux. Run without arguments for the wizard.")
+    parser.add_argument("--version", action="version", version=VERSION)
+    commands = parser.add_subparsers(dest="command")
+    create = commands.add_parser("create", help="create a Desktop app and Claude Code executable")
+    create.add_argument("name")
+    create.add_argument('--app-name', help='Desktop launcher display name (default: Claude <profile>)')
+    create.add_argument('--regular', action='store_true', help='use the existing regular Claude app and claude command')
+    create.add_argument("--alias", help="custom Claude Code executable name (default: claude-<profile>)")
+    create.add_argument("--apps-dir", default=default_apps_dir())
+    create.add_argument("--claude-app", help="Claude.app on macOS; claude-desktop executable/AppImage on Linux")
+    create.add_argument("--rc", help="shell startup file (default: zsh/bash/fish startup file)")
+    create.add_argument("--no-alias", action="store_true")
+    commands.add_parser("list", help="list profiles")
+    migration = commands.add_parser("migrate", help="move legacy account data to ~/.claude-<slug>")
+    migration.add_argument("--check", action="store_true", help="check migration prerequisites without moving data")
+    update = commands.add_parser('update-claude', help='update original Desktop and shared Code to latest, then refresh profiles')
+    update.add_argument('--yes', action='store_true', help='accept Linux package-manager confirmations (sudo may still prompt)')
+    usage = commands.add_parser('openusage', help='update account discovery for OpenUsage usage reporting')
+    usage.add_argument('--disable', action='store_true', help='remove our exports and stop automatic syncing')
+    sync = commands.add_parser('sync-config', help='share user configuration across profiles')
+    sync_actions = sync.add_mutually_exclusive_group()
+    sync_actions.add_argument('--enable', dest='sync_action', action='store_const', const='enable', help='enable and sync now')
+    sync_actions.add_argument('--now', dest='sync_action', action='store_const', const='now', help='sync immediately')
+    sync_actions.add_argument('--disable', dest='sync_action', action='store_const', const='disable', help='stop syncing')
+    sync.set_defaults(sync_action='status')
+    options = commands.add_parser('code-options', help='configure default Code environment variables and flags')
+    options.add_argument('name')
+    options.add_argument('--env', action='append', help='default KEY=VALUE; repeat for multiple variables')
+    options.add_argument('--clear-env', action='store_true', help='clear saved environment defaults')
+    options.add_argument('--flags', help='quoted default flags, e.g. --flags="--no-chrome --model sonnet"')
+    options.add_argument('--from-alias', help='import a simple env/claude alias from your shell startup file')
+    options.add_argument('--rc', help='startup file to read when importing an alias')
+    options.add_argument('--clear', action='store_true', help='remove all saved Code defaults')
+    trust = options.add_mutually_exclusive_group()
+    trust.add_argument('--trust-folders', dest='trust_folders', action='store_const', const=True, default=None,
+                       help='automatically trust each folder launched through this profile')
+    trust.add_argument('--ask-trust', dest='trust_folders', action='store_const', const=False,
+                       help='stop automatically trusting new folders')
+    imports = options.add_mutually_exclusive_group()
+    imports.add_argument('--allow-external-imports', dest='allow_external_imports', action='store_true', default=None,
+                         help='automatically allow external CLAUDE.md imports for projects launched through this profile')
+    imports.add_argument('--ask-external-imports', dest='allow_external_imports', action='store_false',
+                         help='stop automatically approving external CLAUDE.md imports for new projects')
+    commands.add_parser("open").add_argument("name")
+    removal = commands.add_parser("remove", help="remove a profile; optionally delete its data")
+    removal.add_argument("name")
+    removal.add_argument("--purge", action="store_true", help="also delete profile data and Code credentials")
+    removal.add_argument("--yes", action="store_true", help="confirm permanent data deletion without prompting")
+    alias = commands.add_parser("alias", help="rename a profile's Claude Code shell alias")
+    alias.add_argument("name")
+    alias.add_argument("new_alias")
+    reset = commands.add_parser('reset', help='clear profile logins/settings/history; keep its app and command')
+    reset.add_argument('name')
+    reset.add_argument('--yes', action='store_true', help='confirm permanent data deletion without prompting')
+    commands.add_parser("refresh", help="rebuild launchers/icons and repair aliases").add_argument("name", nargs="?")
+    cli = commands.add_parser("code", help="run current Claude Code with a profile; remaining args pass through")
+    cli.add_argument("name")
+    cli.add_argument("arguments", nargs=argparse.REMAINDER)
+    commands.add_parser('global', help='pick a model across accounts and launch Claude Code')
+    global_alias = commands.add_parser('global-alias', help='install or rename the global Claude Code command')
+    global_alias.add_argument('name', nargs='?', help='executable name (default: claude-global)')
+    global_alias.add_argument('--disable', action='store_true', help='remove the global executable')
+    custom = commands.add_parser('custom', help='manage custom Global Claude Code profiles')
+    custom_actions = custom.add_subparsers(dest='custom_action')
+    custom_actions.add_parser('list', help='list custom profiles and prompt folders')
+    custom_set = custom_actions.add_parser('set', help='create or update a custom profile')
+    custom_set.add_argument('name')
+    custom_set.add_argument('--command', dest='custom_command', help='executable name (default: the profile slug)')
+    custom_set.add_argument('--env', action='append', help='KEY=VALUE; repeat for multiple; replaces saved variables')
+    custom_set.add_argument('--clear-env', action='store_true', help='clear saved environment variables')
+    custom_set.add_argument('--flags', help='quoted Claude Code flags; <MANYCLAUDE_PROMPT> opens the prompt picker')
+    custom_set.add_argument('--store', choices=('global', 'separate'),
+                            help='share settings/history with Global (default) or keep them separate')
+    custom_actions.add_parser('remove', help='remove a custom profile and its command').add_argument('name')
+    exporter = commands.add_parser('export', help='list conversations or export one to a .jsonl file')
+    exporter.add_argument('source', nargs='?',
+                          help="profile name, 'global', or 'custom:<name>' (omit to choose in a TUI)")
+    exporter.add_argument('session', nargs='?', help='session ID, unique ID prefix, or latest (this folder)')
+    exporter.add_argument('output', nargs='?', help='destination .jsonl file or folder (default: current folder)')
+    exporter.add_argument('--id', dest='session_id', metavar='ID',
+                          help='export this session ID (or unique prefix) from any store: export --id ID [OUTPUT]')
+    exporter.add_argument('--all', action='store_true', help='list conversations from every project folder')
+    exporter.add_argument('--force', action='store_true', help='replace an existing output file')
+    folders = commands.add_parser('prompt-folders', help='folders whose .md files appear in the prompt picker')
+    folders.add_argument('--add', action='append', metavar='FOLDER')
+    folders.add_argument('--remove', action='append', metavar='FOLDER')
+    args = parser.parse_args(argv)
+    if sys.platform != "darwin" and not LINUX:
+        raise ValueError("manyclaude supports macOS and Linux.")
+    ensure_storage(check=args.command == "migrate" and args.check)
+    if args.command == "migrate":
+        return
+    if args.command is None:
+        return wizard()
+    destructive = args.command == 'reset' or (args.command == 'remove' and args.purge)
+    if destructive and not args.yes:
+        key, profile = get_profile(args.name)
+        print(f"Permanently clear {profile['name']}'s stored logins, settings, and history. Quit its Code sessions first.")
+        for path in reset_paths(key, profile):
+            print('  ' + str(path))
+        print('The regular app/command stay installed.' if profile.get('regular') or args.command == 'reset'
+              else 'The profile app and alias will also be removed.')
+        if not sys.stdin.isatty():
+            raise ValueError('Permanent deletion requires confirmation. Pass --yes to confirm.')
+        if input(f"Type {profile['name']} to confirm: ") != profile['name']:
+            print('Cancelled. Nothing removed.')
+            return
+    if args.command in ("create", "refresh", "remove", "alias", 'reset', 'openusage', 'code-options',
+                        'update-claude', 'sync-config', 'global-alias', 'custom', 'prompt-folders'):
+        BASE.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with (BASE / ".manager.lock").open("a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if args.command in ('custom', 'prompt-folders'):
+                import custom_profiles
+                manager = sys.modules[__name__]
+                if args.command == 'prompt-folders':
+                    return custom_profiles.configure_folders(manager, args.add, args.remove)
+                if args.custom_action == 'set':
+                    return custom_profiles.configure(manager, args.name, command=args.custom_command, env=args.env,
+                                                     clear_env=args.clear_env, flags=args.flags, store=args.store)
+                if args.custom_action == 'remove':
+                    return custom_profiles.remove(manager, args.name)
+                return custom_profiles.listing(manager)
+            if args.command == 'global-alias':
+                from global_code import configure_launcher
+                return configure_launcher(sys.modules[__name__], args.name, args.disable)
+            if args.command == 'update-claude':
+                import updater
+                return updater.update(sys.modules[__name__], yes=args.yes)
+            if args.command == 'openusage':
+                return sync_openusage(enable=not args.disable, disable=args.disable)
+            if args.command == 'sync-config':
+                return sync_config(args.sync_action)
+            if args.command == 'code-options':
+                return code_options(args.name, [] if args.clear_env else args.env, args.flags, args.from_alias,
+                                    args.rc, args.clear, args.trust_folders, args.allow_external_imports)
+            if args.command == "create":
+                return add(args)
+            if args.command == "refresh":
+                return refresh(args.name)
+            if args.command == 'alias':
+                return rename_alias(args.name, args.new_alias)
+            if args.command == 'reset':
+                return reset_data(args.name)
+            return remove(args.name, args.purge)
+    if args.command == "list":
+        return listing()
+    if args.command == 'export':
+        import convo_export
+        return convo_export.command(sys.modules[__name__], args.source, args.session, args.output,
+                                    args.all, args.force, args.session_id)
+    if args.command == "open":
+        return desktop(args.name)
+    if args.command == "code":
+        arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
+        return code_command(args.name, arguments)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (KeyboardInterrupt, EOFError):
+        print("\nCancelled.", file=sys.stderr)
+        sys.exit(130)
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print(f"manyclaude: {error}", file=sys.stderr)
+        sys.exit(1)
