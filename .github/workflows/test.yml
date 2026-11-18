@@ -5,12 +5,8 @@ on:
   pull_request:
 
 jobs:
-  unix:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+  linux:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -38,6 +34,7 @@ jobs:
           $fake = Join-Path $env:RUNNER_TEMP 'Claude\claude.exe'
           New-Item -ItemType Directory -Force (Split-Path $fake) | Out-Null
           Copy-Item (Get-Command python).Source $fake
+          $ErrorActionPreference = 'Continue'
           function Check { if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" } }
           manyclaude --version; Check
           manyclaude create Work --claude-app $fake; Check

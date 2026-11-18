@@ -11,11 +11,12 @@ $BinDir = if ($env:MANYCLAUDE_BIN_DIR) { $env:MANYCLAUDE_BIN_DIR } else { Join-P
 $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Find-Python {
+    $ErrorActionPreference = 'Continue'
     foreach ($candidate in @(@('py', '-3'), @('python'), @('python3'))) {
         $command = Get-Command $candidate[0] -ErrorAction SilentlyContinue
         # The WindowsApps python.exe is a Store installer stub, not an interpreter.
         if (-not $command -or $command.Source -like '*\WindowsApps\*') { continue }
-        $arguments = @($candidate | Select-Object -Skip 1) + @('-c', 'import sys; print(sys.executable if sys.version_info >= (3, 10) else "")')
+        $arguments = @($candidate | Select-Object -Skip 1) + @('-c', 'import sys; sys.version_info >= (3, 10) and print(sys.executable)')
         $executable = (& $command.Source @arguments 2>$null | Select-Object -First 1)
         if ($LASTEXITCODE -eq 0 -and $executable) { return $executable.Trim() }
     }
@@ -46,7 +47,9 @@ try {
         Write-Host "Downloading $Repo@$Ref..."
         $headers = @{ 'User-Agent' = 'manyclaude-installer' }
         $token = $env:GITHUB_TOKEN
-        if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) { $token = (& gh auth token 2>$null) }
+        if (-not $token -and (Get-Command gh -ErrorAction SilentlyContinue)) {
+            $token = & { $ErrorActionPreference = 'Continue'; & gh auth token 2>$null }
+        }
         if ($token) { $headers['Authorization'] = "Bearer $token" }
         $archive = Join-Path $Work 'manyclaude.zip'
         Invoke-WebRequest -UseBasicParsing -Headers $headers -OutFile $archive "https://api.github.com/repos/$Repo/zipball/$Ref"
@@ -81,13 +84,17 @@ try {
     if (-not (($env:Path -split ';') -contains $BinDir)) { $env:Path = "$BinDir;$env:Path" }
 
     # Python's curses module is not bundled on Windows; the wizard needs this wheel.
-    & $Python -m pip install --user --quiet --disable-pip-version-check windows-curses 2>$null | Out-Null
-    if ($LASTEXITCODE -ne 0) {
+    $pipStatus = & {
+        $ErrorActionPreference = 'Continue'
+        & $Python -m pip install --user --quiet --disable-pip-version-check windows-curses 2>&1 | Out-Null
+        $LASTEXITCODE
+    }
+    if ($pipStatus -ne 0) {
         Write-Warning 'Could not install windows-curses; the interactive wizard is unavailable, commands still work.'
     }
 
     $env:MANYCLAUDE_HOME = $InstallDir
-    & $Python $script refresh
+    & { $ErrorActionPreference = 'Continue'; & $Python $script refresh }
     if ($LASTEXITCODE -ne 0) { throw "manyclaude refresh failed (exit $LASTEXITCODE)." }
     Write-Host "Installed: $entry"
     Write-Host 'Open a new terminal, then run: manyclaude'
