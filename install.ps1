@@ -1,6 +1,8 @@
 # ManyClaude installer for Windows.
 #   irm https://raw.githubusercontent.com/NZ-Linix/manyclaude/main/install.ps1 | iex
 # Run from a checkout (.\install.ps1) to install that copy instead of downloading.
+[CmdletBinding()]
+param()
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
@@ -12,13 +14,20 @@ $Utf8 = New-Object System.Text.UTF8Encoding($false)
 
 function Find-Python {
     $ErrorActionPreference = 'Continue'
-    foreach ($candidate in @(@('py', '-3'), @('python'), @('python3'))) {
-        $command = Get-Command $candidate[0] -ErrorAction SilentlyContinue
+    $candidates = @(
+        @{ Exe = 'py'; Prefix = @('-3') },
+        @{ Exe = 'python'; Prefix = @() },
+        @{ Exe = 'python3'; Prefix = @() }
+    )
+    foreach ($candidate in $candidates) {
+        $command = Get-Command $candidate.Exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
         # The WindowsApps python.exe is a Store installer stub, not an interpreter.
         if (-not $command -or $command.Source -like '*\WindowsApps\*') { continue }
-        $arguments = @($candidate | Select-Object -Skip 1) + @('-c', 'import sys; sys.version_info >= (3, 10) and print(sys.executable)')
-        $executable = (& $command.Source @arguments 2>$null | Select-Object -First 1)
-        if ($LASTEXITCODE -eq 0 -and $executable) { return $executable.Trim() }
+        $arguments = $candidate.Prefix + @('-c', 'import sys; print(sys.executable if sys.version_info[:2] >= (3, 10) else 0)')
+        $output = & $command.Source @arguments 2>$null
+        $executable = if ($output) { ([string]($output | Select-Object -Last 1)).Trim() } else { '' }
+        Write-Verbose "$($command.Source) -> $executable"
+        if ($executable -and $executable -ne '0' -and (Test-Path $executable)) { return $executable }
     }
     return $null
 }

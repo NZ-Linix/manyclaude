@@ -25,7 +25,7 @@ jobs:
         run: python -m unittest tests.test_windows -v
       - name: Install from checkout
         shell: powershell
-        run: .\install.ps1
+        run: .\install.ps1 -Verbose
       - name: Smoke test profile lifecycle
         shell: powershell
         run: |
