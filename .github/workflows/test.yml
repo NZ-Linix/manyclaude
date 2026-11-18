@@ -33,7 +33,7 @@ jobs:
           $env:Path = [Environment]::GetEnvironmentVariable('Path', 'User') + ';' + $env:Path
           $fake = Join-Path $env:RUNNER_TEMP 'Claude\claude.exe'
           New-Item -ItemType Directory -Force (Split-Path $fake) | Out-Null
-          Copy-Item (Get-Command python).Source $fake
+          Copy-Item (Join-Path $env:pythonLocation 'python.exe') $fake
           $ErrorActionPreference = 'Continue'
           function Check { if ($LASTEXITCODE -ne 0) { throw "exit $LASTEXITCODE" } }
           manyclaude --version; Check
